@@ -1,0 +1,12 @@
+{
+	"name": "dlang-aws-fpga",
+	"authors": [
+		"outland.karasu@gmail.com"
+	],
+	"description": "AWS FPGA demo for D language.",
+	"copyright": "Copyright © 2018, outland.karasu@gmail.com",
+	"license": "BSL-1.0",
+        "dependencies": {
+            "dcltk": { "path": "./dcltk" }
+        }
+}

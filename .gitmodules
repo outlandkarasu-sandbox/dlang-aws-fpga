@@ -1,0 +1,3 @@
+[submodule "dcltk"]
+	path = dcltk
+	url = git@github.com:outlandkarasu/dcltk.git

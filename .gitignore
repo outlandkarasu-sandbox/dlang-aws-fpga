@@ -1,0 +1,14 @@
+.dub
+docs.json
+__dummy.html
+docs/
+dlang-aws-fpga.so
+dlang-aws-fpga.dylib
+dlang-aws-fpga.dll
+dlang-aws-fpga.a
+dlang-aws-fpga.lib
+dlang-aws-fpga-test-*
+*.exe
+*.o
+*.obj
+*.lst
