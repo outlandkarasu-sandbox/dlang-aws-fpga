@@ -12,3 +12,4 @@ dlang-aws-fpga-test-*
 *.o
 *.obj
 *.lst
+/dlang-aws-fpga

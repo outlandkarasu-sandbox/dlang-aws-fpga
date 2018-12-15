@@ -6,6 +6,7 @@
 	"description": "AWS FPGA demo for D language.",
 	"copyright": "Copyright © 2018, outland.karasu@gmail.com",
 	"license": "BSL-1.0",
+        "stringImportPaths": ["./kernel"],
         "dependencies": {
             "dcltk": { "path": "./dcltk" }
         }
