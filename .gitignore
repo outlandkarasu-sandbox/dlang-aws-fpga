@@ -13,3 +13,5 @@ dlang-aws-fpga-test-*
 *.obj
 *.lst
 /dlang-aws-fpga
+/.run/
+

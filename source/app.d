@@ -1,4 +1,5 @@
 import std.datetime.stopwatch : benchmark;
+import std.file : read;
 import std.math : approxEqual, sqrt, floor, ceil;
 import std.parallelism : parallel;
 import std.random : uniform01;
@@ -8,11 +9,72 @@ import std.string : format;
 import std.traits : isIntegral;
 
 import cl = dcltk;
-import derelict.opencl.cl : cl_event;
+import derelict.opencl.cl :
+    cl_context,
+    cl_event,
+    cl_int,
+    cl_mem,
+    cl_mem_flags,
+    CL_DEVICE_TYPE_ACCELERATOR,
+    clCreateBuffer,
+    CL_MEM_READ_WRITE,
+    CL_MEM_READ_ONLY,
+    CL_MEM_WRITE_ONLY,
+    CL_MEM_HOST_WRITE_ONLY,
+    CL_MEM_HOST_READ_ONLY,
+    CL_MEM_COPY_HOST_PTR;
+
+enum DdrBank {
+    bank0 = 0b0001,
+    bank1 = 0b0010,
+    bank2 = 0b0100,
+    bank3 = 0b1000,
+}
+
+enum CL_MEM_EXT_PTR_XILINX = cast(cl_mem_flags)(1 << 31);
+
+struct cl_mem_ext_ptr_t {
+  uint flags;
+  const(void)* obj;
+  void* param;
+}
+
+private cl_mem createDeviceBuffer(cl_context context, size_t size, const(void)* data, cl_mem_flags flags, DdrBank bank) {
+    cl_int errorCode;
+    cl_mem_ext_ptr_t mem = {bank, data};
+    auto buffer = clCreateBuffer(
+            context,
+            flags | CL_MEM_EXT_PTR_XILINX,
+            size,
+            &mem,
+            &errorCode);
+    cl.enforceCl(errorCode);
+    return buffer;
+}
+
+private cl_mem createDeviceReadBuffer(cl_context context, const(void)[] data, DdrBank bank) {
+    return createDeviceBuffer(
+        context, data.length, data.ptr, CL_MEM_READ_ONLY | CL_MEM_HOST_WRITE_ONLY | CL_MEM_COPY_HOST_PTR, bank);
+}
+
+private cl_mem createDeviceWriteBuffer(cl_context context, size_t size, DdrBank bank) {
+    return createDeviceBuffer(
+        context, size, null, CL_MEM_WRITE_ONLY | CL_MEM_HOST_READ_ONLY, bank);
+}
 
 /// round up for unit.
 private T roundUp(T)(T value, T unit) @safe pure nothrow @nogc if(isIntegral!T) {
     return (value + unit - 1) / unit * unit;
+}
+
+private T[] transpose(T)(const(T)[] values, size_t rows, size_t cols) {
+    auto result = new T[values.length];
+    foreach(i; 0 .. rows) {
+        foreach(j; 0 .. cols) {
+            result[j * rows + i] = values[i * cols + j];
+        }
+    }
+    return result;
 }
 
 /// matrix product by CPU.
@@ -60,15 +122,10 @@ unittest {
 void main() {
     // matrix size.
     enum {
-        ROWS = 4096,
-        COLS = 4096,
-        RESULT_COLS = 4096,
-        BATCH_ROWS = 128,
-        BATCH_COLS = 128,
-        //BATCH_SIZE_K = 8, // for NVIDIA GeForce GTX 960M
-        BATCH_SIZE_K = 32, // for Tesla K80
-        PRIVATE_ROWS = 8,
-        PRIVATE_COLS = 8
+        ROWS = 64,
+        COLS = 64,
+        RESULT_COLS = 64,
+        GROUP_SIZE = 2,
     }
 
     // initialize operand matrixes.
@@ -92,7 +149,7 @@ void main() {
         cl.getPlatformVendor(platformId),
         cl.getPlatformExtensions(platformId));
 
-    auto context = cl.createDefaultContext(platformId);
+    auto context = cl.createContextFromType(platformId, CL_DEVICE_TYPE_ACCELERATOR);
     scope(exit) cl.releaseContext(context);
     auto deviceIds = cl.getContextDeviceIds(context);
     if(deviceIds.length <= 0) {
@@ -116,8 +173,8 @@ void main() {
     auto commandQueue = cl.createCommandQueue(context, device);
     scope(exit) cl.releaseCommandQueue(commandQueue);
 
-    auto program = cl.createProgramWithSource(
-        context, import("product.cl").format(BATCH_ROWS, BATCH_COLS, BATCH_SIZE_K, PRIVATE_ROWS, PRIVATE_COLS));
+    auto program = cl.createProgramWithBinary(
+        context, device, cast(ubyte[]) read("./product.xclbin"));
     scope(exit) cl.releaseProgram(program);
     cl.buildProgram(program, deviceIds);
 
@@ -125,9 +182,12 @@ void main() {
     scope(exit) cl.releaseKernel(kernel);
 
     // calculate padded matrix size.
-    immutable bufferCols = cast(uint) roundUp(COLS, BATCH_COLS);
-    immutable bufferRows = cast(uint) roundUp(ROWS, BATCH_ROWS);
-    immutable bufferResultCols = cast(uint) roundUp(RESULT_COLS, BATCH_COLS);
+    immutable bufferCols = cast(uint) roundUp(COLS, GROUP_SIZE);
+    assert(bufferCols == COLS);
+    immutable bufferRows = cast(uint) roundUp(ROWS, GROUP_SIZE);
+    assert(bufferRows == ROWS);
+    immutable bufferResultCols = cast(uint) roundUp(RESULT_COLS, GROUP_SIZE);
+    assert(bufferResultCols == RESULT_COLS);
     writefln("bc: %s, br: %s, brc: %s", bufferCols, bufferRows, bufferResultCols);
 
     immutable lhsSize = bufferCols * bufferRows;
@@ -135,32 +195,13 @@ void main() {
     immutable resultSize = bufferResultCols * bufferRows;
 
     // create buffers.
-    auto lhsBuffer = cl.createHostWriteOnlyBuffer(context, lhsSize * float.sizeof);
+    auto lhsBuffer = createDeviceReadBuffer(context, lhs, DdrBank.bank0);
     scope(exit) cl.releaseBuffer(lhsBuffer);
-    auto rhsBuffer = cl.createHostWriteOnlyBuffer(context, rhsSize * float.sizeof);
+    auto rhsT = transpose(rhs, bufferCols, bufferResultCols);
+    auto rhsBuffer = createDeviceReadBuffer(context, rhsT, DdrBank.bank1);
     scope(exit) cl.releaseBuffer(rhsBuffer);
-    auto resultBuffer = cl.createHostReadOnlyBuffer(context, resultSize * float.sizeof);
+    auto resultBuffer = createDeviceWriteBuffer(context, resultSize * float.sizeof, DdrBank.bank2);
     scope(exit) cl.releaseBuffer(resultBuffer);
-
-    // copy parameter matrixes.
-    cl.enqueueFillBuffer(
-        commandQueue, lhsBuffer, [0.0f], 0, lhsSize);
-    cl.enqueueWriteBuffer(
-        commandQueue,
-        lhsBuffer,
-        cl.Position(0, 0),
-        cl.Region(COLS, ROWS),
-        bufferCols,
-        lhs);
-    cl.enqueueFillBuffer(
-        commandQueue, rhsBuffer, [0.0f], 0, rhsSize);
-    cl.enqueueWriteBuffer(
-        commandQueue,
-        rhsBuffer,
-        cl.Position(0, 0),
-        cl.Region(RESULT_COLS, COLS),
-        bufferResultCols,
-        rhs);
 
     // set kernel arguments.
     cl.setKernelArg(kernel, 0, lhsBuffer);
@@ -170,15 +211,8 @@ void main() {
     cl.setKernelArg(kernel, 4, bufferCols);
     cl.setKernelArg(kernel, 5, bufferResultCols);
 
-    writefln("kernel w: %s, pw: %s",
-        cl.getKernelWorkGroupSize(kernel, device),
-        cl.getKernelPreferredWorkGroupSizeMultiple(kernel, device));
-
-    immutable(size_t)[] globalWorkSizes = [
-        bufferResultCols / PRIVATE_COLS,
-        bufferRows / PRIVATE_ROWS
-    ];
-    immutable(size_t)[] localWorkSizes = [BATCH_COLS / PRIVATE_COLS, BATCH_ROWS / PRIVATE_ROWS];
+    immutable(size_t)[] globalWorkSizes = [RESULT_COLS, ROWS];
+    immutable(size_t)[] localWorkSizes = [GROUP_SIZE, GROUP_SIZE];
     writefln("workSizes: %s, %s", localWorkSizes, globalWorkSizes);
 
     void productGpu() {
@@ -189,19 +223,13 @@ void main() {
 
     // benchmark CPU and GPU.
     cl.finishCommandQueue(commandQueue);
-    immutable gpuMsecs = benchmark!(() => productGpu())(4)[0].total!"msecs" / 4;
+    enum REPEAT = 1;
+    immutable gpuMsecs = benchmark!(() => productGpu())(REPEAT)[0].total!"msecs" / REPEAT;
     immutable gpuFlops = (cast(real) ROWS) * RESULT_COLS * (COLS * 2.0) / ((cast(real) gpuMsecs) / 1000.0);
     
     version(DcltkWithCpuTest) {
         cl_event event;
-        cl.enqueueReadBuffer(
-            commandQueue,
-            resultBuffer,
-            cl.Position(0, 0),
-            cl.Region(RESULT_COLS, ROWS),
-            bufferResultCols,
-            gpuResult,
-            event);
+        cl.enqueueReadBuffer(commandQueue, resultBuffer, 0, gpuResult, event);
         cl.waitAndReleaseEvents(event);
 
         immutable cpuMsecs = benchmark!(() => productCpu(
@@ -214,9 +242,10 @@ void main() {
 
         // check result values.
         foreach(i, e; cpuResult) {
-            assert(approxEqual(e, gpuResult[i]));
+            assert(approxEqual(e, gpuResult[i]), "[%d] %s != %s".format(i, e, gpuResult[i]));
         }
     } else {
         writefln("gpu: %d msecs (%.1f GFLOPS)", gpuMsecs, gpuFlops / (10.0^^9));
     }
 }
+
